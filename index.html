@@ -63,6 +63,8 @@ button{font:inherit;color:var(--tx);cursor:pointer}
 .rm{stroke:var(--ac);stroke-width:7;stroke-linecap:round}
 .rb{stroke:var(--bad);stroke-width:9;stroke-linecap:round}
 .ax{stroke:#2a3441;stroke-width:2;stroke-dasharray:8 8}
+.ax.hl{stroke:var(--warn);stroke-width:4}
+.instr{font-size:26px;font-weight:700;margin:2px 0 4px}
 .row{display:flex;gap:10px;flex-wrap:wrap;margin-top:12px}
 .row .btn{flex:1 1 130px}
 .tl{font-size:20px;font-variant-numeric:tabular-nums}
@@ -192,30 +194,88 @@ function shapeSVG(sh,L){
 /* ------------------------- GAME 2: PERSPECTIVE MAPPING ------------------------- */
 /* h[x][y] = stack height. x = left→right, y = front→back, z = up. */
 const P2=[[3,3,2,3,4,0],[3,3,2,4,5,0],[3,3,3,4,6,0],[3,3,3,5,6,0],[3,3,3,6,7,1],[4,4,3,7,8,1],[4,4,4,8,10,2],[4,4,4,10,12,2],[4,4,4,12,15,3]]; /* W,D,maxH,minCubes,maxCubes,minHidden */
-function hiddenCount(h,W,D){let c=0;for(let x=0;x<W;x++)for(let y=0;y<D;y++)for(let z=0;z<h[x][y];z++)if(x+1<W&&h[x+1][y]>z&&y>0&&h[x][y-1]>z&&h[x][y]>z+1)c++;return c}
+/* Visibility. A face is sampled on a 3x3 grid; a sample is visible when the ray towards the camera
+   (direction +1,-1,+1: the picture's viewpoint) is not blocked. faceMask returns the 9 sample bits. */
+const Hc=(h,W,D,a,b)=>a>=0&&a<W&&b>=0&&b<D?h[a][b]:0;
+function faceMask(h,W,D,MH,x,y,z,f){
+ if((f===0&&Hc(h,W,D,x,y)>z+1)||(f===1&&Hc(h,W,D,x,y-1)>z)||(f===2&&Hc(h,W,D,x+1,y)>z))return 0;
+ let mask=0;
+ for(let i=0;i<3;i++)for(let j=0;j<3;j++){
+  const u=(i+.5)/3,v=(j+.5)/3,p=f===0?[x+u,y+v,z+1+1e-4]:f===1?[x+u,y-1e-4,z+v]:[x+1+1e-4,y+u,z+v];
+  let blocked=false;
+  for(let s=1;s<=55;s++){const t=s*.1,qx=p[0]+t,qy=p[1]-t,qz=p[2]+t;
+   if(qx>=W||qy<0||qz>=MH)break;
+   if(qy<D&&Hc(h,W,D,Math.floor(qx),Math.floor(qy))>Math.floor(qz)){blocked=true;break}}
+  if(!blocked)mask|=1<<(i*3+j);
+ }
+ return mask;
+}
+const pop9=m=>{let c=0;for(;m;m&=m-1)c++;return c};
+const faceVis=(h,W,D,MH,x,y,z,f)=>pop9(faceMask(h,W,D,MH,x,y,z,f))/9;
+const cubeBest=(h,W,D,MH,x,y,z)=>Math.max(faceVis(h,W,D,MH,x,y,z,0),faceVis(h,W,D,MH,x,y,z,1),faceVis(h,W,D,MH,x,y,z,2));
+/* identity of a drawn face: its type, its position in the picture and which parts of it are visible */
+const faceKey=(x,y,z,f,m)=>f===0?`0:${x+y}:${-x+y+2*z+2}:${m}`:f===1?`1:${x+y}:${-x+y+2*z}:${m}`:`2:${x+1+y}:${-x-1+y+2*z}:${m}`;
+/* Levels 0-3: every cube must be clearly visible. Levels 4+: every column's TOP cube must be clearly visible
+   (so heights can be read), and the required number of lower cubes are hidden (to be inferred by stacking). */
+function visOK(h,W,D,MH,L,hid){
+ let hidden=0;
+ for(let x=0;x<W;x++)for(let y=0;y<D;y++)for(let z=0;z<h[x][y];z++){
+  if(cubeBest(h,W,D,MH,x,y,z)>=.5)continue;
+  if(L<4||z===h[x][y]-1)return false;
+  hidden++;
+ }
+ return hidden>=(L<4?0:hid);
+}
+/* The picture must determine the answer. Searches every stack-height map that would be drawn as the SAME picture
+   (cells are filled nearest-to-camera first, so a cell's visible faces can be checked as soon as it is set).
+   Returns true only when all of them give identical front/back/left/right/top views. */
+const viewsKey=(h,W,D,MH)=>{const V=views(h,W,D,MH);return JSON.stringify(['front','back','left','right','top'].map(k=>V[k].m))};
+function determinate(h,W,D,MH){
+ const target=new Set();
+ for(let x=0;x<W;x++)for(let y=0;y<D;y++)for(let z=0;z<h[x][y];z++)for(let f=0;f<3;f++){const m=faceMask(h,W,D,MH,x,y,z,f);if(m)target.add(faceKey(x,y,z,f,m))}
+ const order=[];for(let x=W-1;x>=0;x--)for(let y=0;y<D;y++)order.push([x,y]);
+ const g=Array.from({length:W},()=>Array(D).fill(0)),ref=viewsKey(h,W,D,MH),got=new Set();
+ let ok=true,nodes=0;
+ (function dfs(i){
+  if(!ok)return;
+  if(i===order.length){if(got.size===target.size&&viewsKey(g,W,D,MH)!==ref)ok=false;return}
+  const[x,y]=order[i],side=[];
+  const sideKeys=z=>side[z]||(side[z]=[1,2].map(f=>{const m=faceMask(g,W,D,MH,x,y,z,f);return m?faceKey(x,y,z,f,m):null}));
+  for(let c=0;c<=MH&&ok;c++){
+   if(++nodes>15000){ok=false;return}
+   g[x][y]=c;const ks=[],add=[];let valid=true;
+   for(let z=0;z<c;z++)sideKeys(z).forEach(k=>{if(k)ks.push(k)});
+   if(c>0){const m=faceMask(g,W,D,MH,x,y,c-1,0);if(m)ks.push(faceKey(x,y,c-1,0,m))}
+   for(const k of ks){if(!target.has(k)){valid=false;break}if(!got.has(k)){got.add(k);add.push(k)}}
+   if(valid)dfs(i+1);
+   add.forEach(k=>got.delete(k));
+  }
+  g[x][y]=0;
+ })(0);
+ return ok;
+}
 function views(h,W,D,MH){
  const fr=[],rt=[];
  for(let x=0;x<W;x++){let m=0;for(let y=0;y<D;y++)m=Math.max(m,h[x][y]);fr.push(m)}
  for(let y=0;y<D;y++){let m=0;for(let x=0;x<W;x++)m=Math.max(m,h[x][y]);rt.push(m)}
  const sil=c=>({k:'s',c,m:Array.from({length:MH},(_,r)=>c.map(v=>v>=MH-r?1:0))});
- const top=Array.from({length:D},(_,r)=>Array.from({length:W},(_,c)=>h[c][D-1-r]));
+ const top=Array.from({length:D},(_,r)=>Array.from({length:W},(_,c)=>h[c][D-1-r]>0?1:0));
  return{front:sil(fr),back:sil(fr.slice().reverse()),right:sil(rt),left:sil(rt.slice().reverse()),top:{k:'t',m:top}};
 }
 const rotM=(m,k)=>{k=((k%4)+4)%4;for(;k>0;k--){const R=m.length,C=m[0].length;m=Array.from({length:C},(_,r)=>Array.from({length:R},(_,c)=>m[R-1-c][r]))}return m};
 /* orientation-independent identity of a projection */
-const classKey=v=>{let b=null;for(let i=0;i<4;i++){const s=v.k+JSON.stringify(rotM(v.m,i));if(b===null||s<b)b=s}return b};
+const classKey=v=>{let b=null;for(let i=0;i<4;i++){const s=JSON.stringify(rotM(v.m,i));if(b===null||s<b)b=s}return b};
 function nearV(v,MH){
  if(v.k==='s'){const c=v.c.slice(),i=rnd(c.length),d=rnd(2)?1:-1,n=c[i]+d;if(n<0||n>MH)return v;c[i]=n;
   return{k:'s',c,m:Array.from({length:MH},(_,r)=>c.map(x=>x>=MH-r?1:0))}}
- const m=v.m.map(r=>r.slice()),r=rnd(m.length),c=rnd(m[0].length),n=m[r][c]+(rnd(2)?1:-1);
- if(n<0||n>MH)return v;m[r][c]=n;return{k:'t',m};
+ const m=v.m.map(r=>r.slice()),r=rnd(m.length),c=rnd(m[0].length);m[r][c]=1-m[r][c];return{k:'t',m};
 }
-function genG2(L){
+function tryG2(L){
  const[W,D,MH,mn,mx,hid]=P2[L],vps=L<2?['front','top']:L<5?['front','top','left','right']:['front','back','left','right','top'];
- for(let t=0;t<4000;t++){
+ {
   const h=Array.from({length:W},()=>Array(D).fill(0)),n=mn+rnd(mx-mn+1);
   for(let i=0;i<n;i++){let c;do{c=[rnd(W),rnd(D)]}while(h[c[0]][c[1]]>=MH);h[c[0]][c[1]]++}
-  if(hiddenCount(h,W,D)<hid&&t<3900)continue;
+  if(!visOK(h,W,D,MH,L,hid)||!determinate(h,W,D,MH))return null;
   const V=views(h,W,D,MH),vp=pick(vps),cor=V[vp],seen=new Set([classKey(cor)]),ds=[];
   const add=v=>{const k=classKey(v);if(seen.has(k))return false;seen.add(k);ds.push(v);return true};
   const nNear=[0,0,0,2,2,2,2,3,3][L];
@@ -224,7 +284,7 @@ function genG2(L){
   for(let i=0;i<60&&ds.length<tgt;i++)add(nearV(cor,MH));
   shuffle(Object.keys(V).filter(k=>k!==vp)).forEach(k=>{if(ds.length<3)add(V[k])});
   for(let i=0;i<60&&ds.length<3;i++)add(nearV(cor,MH));
-  if(ds.length<3)continue;
+  if(ds.length<3)return null;
   const opts=[{v:cor,ok:1},...ds.map(v=>({v,ok:0}))];
   let angs;
   if(L===0)angs=[0,0,0,0];
@@ -234,14 +294,14 @@ function genG2(L){
   opts.forEach((o,i)=>{o.a=angs[i];o.m=rotM(o.v.m,angs[i]/90)});
   return{h,W,D,MH,vp,opts};
  }
- return genG2(Math.max(0,L-1));
 }
+/* one trial: retries single attempts (the session also keeps a few ready in the background) */
+function genG2(L){for(;;){const t=tryG2(L);if(t)return t}}
 function matSVG(o){
- const m=o.m,R=m.length,C=m[0].length,top=o.v.k==='t',sh=['#1d3f66','#2f6fb0','#4a9eff','#8cc4ff'];
+ const m=o.m,R=m.length,C=m[0].length;
  let s=`<svg viewBox="-.2 -.2 ${C+.4} ${R+.4}">`;
- for(let r=0;r<R;r++)for(let c=0;c<C;c++){const v=m[r][c];
-  s+=`<rect x="${c}" y="${r}" width="1" height="1" fill="${v?(top?sh[Math.min(v,4)-1]:'#4a9eff'):'none'}" stroke="${v?'#0e1217':'#2a3441'}" stroke-width=".05"/>`;
-  if(top&&v)s+=`<text x="${c+.5}" y="${r+.68}" font-size=".5" text-anchor="middle" fill="${v>=3?'#06121f':'#e8edf2'}" font-family="system-ui,sans-serif">${v}</text>`}
+ for(let r=0;r<R;r++)for(let c=0;c<C;c++)
+  s+=`<rect x="${c}" y="${r}" width="1" height="1" fill="${m[r][c]?'#4a9eff':'none'}" stroke="${m[r][c]?'#0e1217':'#2a3441'}" stroke-width=".05"/>`;
  return s+'</svg>';
 }
 function isoSVG(h,W,D){
@@ -256,10 +316,10 @@ function isoSVG(h,W,D){
   poly([[x,y,z],[x+1,y,z],[x+1,y,z+1],[x,y,z+1]],'#4a9eff');
   poly([[x+1,y,z],[x+1,y+1,z],[x+1,y+1,z+1],[x+1,y,z+1]],'#2b6cb0')});
  const lf=P(W/2,0,0),lr=P(W,D/2,0);
- const lab=[[lf[0]-.6,lf[1]+.55,'front'],[lr[0]+.6,lr[1]+.55,'right']];lab.forEach(l=>all.push([l[0]-.5,l[1]+.1],[l[0]+.5,l[1]]));
+ const lab=[[lf[0]-.7,lf[1]+.65,'FRONT'],[lr[0]+.7,lr[1]+.65,'RIGHT']];lab.forEach(l=>all.push([l[0]-.95,l[1]+.1],[l[0]+.95,l[1]]));
  const xs=all.map(p=>p[0]),ys=all.map(p=>p[1]),x0=Math.min(...xs)-.3,y0=Math.min(...ys)-.3;
  return`<svg viewBox="${x0} ${y0} ${Math.max(...xs)+.3-x0} ${Math.max(...ys)+.3-y0}">`+polys.join('')+
-  lab.map(l=>`<text x="${l[0]}" y="${l[1]}" font-size=".42" text-anchor="middle" fill="#93a1b1" font-family="system-ui,sans-serif">${l[2]}</text>`).join('')+'</svg>';
+  lab.map(l=>`<text x="${l[0]}" y="${l[1]}" font-size=".5" text-anchor="middle" fill="#c3ced9" font-family="system-ui,sans-serif">${l[2]}</text>`).join('')+'</svg>';
 }
 
 /* ------------------------- GAME 3: SPATIAL TRANSFORMATION PAD ------------------------- */
@@ -272,7 +332,7 @@ const segMap=lines=>{const m=new Map();lines.forEach(([a,b])=>splitLine(a,b).for
 /* matrices [a,b,c,d]: (x,y) -> (a x + b y, c x + d y), y up */
 const OPS={RL:[0,-1,1,0],RR:[0,1,-1,0],MH:[1,0,0,-1],MV:[-1,0,0,1]};
 const OPN={RL:'Rotate left',RR:'Rotate right',MH:'Mirror horizontal',MV:'Mirror vertical'};
-const OPD={RL:'90° anticlockwise',RR:'90° clockwise',MH:'across the horizontal axis (top ⇄ bottom)',MV:'across the vertical axis (left ⇄ right)'};
+const OPD={RL:'Turn the pattern 90° anticlockwise around the centre',RR:'Turn the pattern 90° clockwise around the centre',MH:'Flip the pattern across the horizontal axis (top ⇄ bottom)',MV:'Flip the pattern across the vertical axis (left ⇄ right)'};
 const IDM=[1,0,0,1];
 const mul=(A,B)=>[A[0]*B[0]+A[1]*B[2],A[0]*B[1]+A[1]*B[3],A[2]*B[0]+A[3]*B[2],A[2]*B[1]+A[3]*B[3]];
 const ap=(M,p)=>[M[0]*p[0]+M[1]*p[1]+0,M[2]*p[0]+M[3]*p[1]+0];
@@ -283,18 +343,7 @@ const keysEq=(A,B)=>A.size===B.size&&[...A.keys()].every(k=>B.has(k));
 const J=(A,B)=>{let i=0;A.forEach((_,k)=>{if(B.has(k))i++});const u=A.size+B.size-i;return u?i/u:1};
 const cross=(o,a,b)=>(a[0]-o[0])*(b[1]-o[1])-(a[1]-o[1])*(b[0]-o[0]);
 const properX=(l1,l2)=>{const[a,b]=l1,[c,d]=l2;const d1=cross(a,b,c),d2=cross(a,b,d),d3=cross(c,d,a),d4=cross(c,d,b);return d1*d2<0&&d3*d4<0};
-const OPCNT=[()=>1,()=>1,()=>1,()=>2,()=>2,()=>3,()=>3,()=>3+rnd(2),()=>4+rnd(2)];
-
-function genOps(L){
- for(;;){
-  const c=OPCNT[L](),ops=[];
-  for(let i=0;i<c;i++)ops.push(pick(Object.keys(OPS)));
-  let bad=false;
-  for(let i=1;i<c;i++){const a=ops[i-1],b=ops[i];if((a==='RL'&&b==='RR')||(a==='RR'&&b==='RL')||(a===b&&a[0]==='M'))bad=true}
-  if(L>=5&&!(ops.some(o=>o[0]==='R')&&ops.some(o=>o[0]==='M')))bad=true;
-  if(!bad)return ops;
- }
-}
+const genOps=()=>[pick(Object.keys(OPS))]; /* exactly ONE instruction per task */
 function genLines(L,n){
  const m=(n-1)/2,rp=()=>[rnd(n)-m,rnd(n)-m],near=(a,b)=>Math.abs(a[0]-b[0])<=3&&Math.abs(a[1]-b[1])<=3;
  const ang=pts=>{const cx=pts.reduce((s,p)=>s+p[0],0)/pts.length,cy=pts.reduce((s,p)=>s+p[1],0)/pts.length;return pts.slice().sort((a,b)=>Math.atan2(a[1]-cy,a[0]-cx)-Math.atan2(b[1]-cy,b[0]-cx))};
@@ -328,9 +377,8 @@ function genLines(L,n){
 function genPat(L){
  const n=L<5?5:7,m=(n-1)/2;
  for(let t=0;t<500;t++){
-  const lines=genLines(L,n),ref=segMap(lines),ops=genOps(L),M=compose(ops),exp=mapSegs(M,ref);
-  if(keysEq(ref,exp))continue;
-  if(ops.length>1&&M.every((v,i)=>v===IDM[i]))continue;
+  const lines=genLines(L,n),ref=segMap(lines),ops=genOps(),M=compose(ops),exp=mapSegs(M,ref);
+  if(keysEq(ref,exp))continue; /* the instruction must visibly change the pattern */
   return{n,m,lines,ref,ops,M,exp};
  }
  const lines=[[[-2,-2],[1,-2]],[[1,-2],[1,1]]],ref=segMap(lines),ops=['RR'],M=compose(ops);
@@ -338,11 +386,11 @@ function genPat(L){
 }
 const PX=(x,m)=>(x+m+.5)*100,PY=(y,m)=>(m-y+.5)*100;
 function segsSVG(segs,m,cls){let s='';segs.forEach(([p,q])=>{s+=`<line x1="${PX(p[0],m)}" y1="${PY(p[1],m)}" x2="${PX(q[0],m)}" y2="${PY(q[1],m)}" class="${cls}"/>`});return s}
-function latSVG(n,layers,used,sel,id){
+function latSVG(n,layers,used,sel,id,hl){
  const m=(n-1)/2,sz=n*100;let pts='';
  for(let x=-m;x<=m;x++)for(let y=-m;y<=m;y++){const k=x+','+y,c=sel&&sel[0]===x&&sel[1]===y?'sel':used&&used.has(k)?'used':'';
   pts+=`<circle cx="${PX(x,m)}" cy="${PY(y,m)}" r="${c?15:11}" class="pt ${c}"/>`}
- return`<svg ${id?`id="${id}"`:''} viewBox="0 0 ${sz} ${sz}"><line x1="0" y1="${sz/2}" x2="${sz}" y2="${sz/2}" class="ax"/><line x1="${sz/2}" y1="0" x2="${sz/2}" y2="${sz}" class="ax"/>${layers}${pts}</svg>`;
+ return`<svg ${id?`id="${id}"`:''} viewBox="0 0 ${sz} ${sz}"><line x1="0" y1="${sz/2}" x2="${sz}" y2="${sz/2}" class="ax${hl==='h'?' hl':''}"/><line x1="${sz/2}" y1="0" x2="${sz/2}" y2="${sz}" class="ax${hl==='v'?' hl':''}"/>${layers}${pts}</svg>`;
 }
 
 /* ------------------------- SESSION ENGINE ------------------------- */
@@ -354,14 +402,19 @@ const fmt=ms=>{ms=Math.max(0,Math.ceil(ms/1000));return Math.floor(ms/60)+':'+St
 function startSession(){
  const v=$('#vis').value;
  const cfg={game:$('#g').value,level:+$('#lv').value,dur:+$('#dur').value*60000,mem:$('#mem').value,visMs:v==='vis'?Infinity:+v,visKeep:v==='vis',ret:+$('#ret').value*1000,fb:$('#fb').value==='on',g3t:+$('#g3t').value*1000};
- S={cfg,t0:performance.now(),trials:[],n:{1:0,2:0,3:0},seq:0,cur:null,timers:new Set(),done:false,lastPos:{},tick:null};
- show('play');tickHud();S.tick=setInterval(tickHud,250);nextTrial();
+ S={cfg,t0:performance.now(),trials:[],n:{1:0,2:0,3:0},seq:0,cur:null,timers:new Set(),done:false,lastPos:{},tick:null,q2:[]};
+ show('play');tickHud();S.tick=setInterval(tickHud,250);fillQ();nextTrial();
 }
 function tickHud(){
  if(!S||S.done)return;
  const el=performance.now()-S.t0,rem=S.cfg.dur-el;
  if(rem<=0){endSession();return}
  $('#hTime').textContent=fmt(rem);$('#barI').style.width=Math.min(100,100*el/S.cfg.dur)+'%';
+}
+/* Game 2 puzzles are checked for a unique answer, which can take a moment at high levels, so a few are prepared in the background */
+function fillQ(){
+ if(!S||S.done||(S.cfg.game!=='2'&&S.cfg.game!=='all')||S.q2.length>=3)return;
+ later(()=>{const t=tryG2(S.cfg.level);if(t)S.q2.push(t);fillQ()},20);
 }
 function nextTrial(){
  if(!S||S.done)return;
@@ -387,13 +440,14 @@ function phases(cur,hide,resp){
 
 /* ---- Games 1 and 2: multiple choice ---- */
 function runChoice(cur,g){
- const L=S.cfg.level,T=g===1?genG1(L):genG2(L);
+ const L=S.cfg.level,T=g===1?genG1(L):(S.q2.shift()||genG2(L));
+ if(g===2)fillQ();
  /* shuffle option positions; avoid the correct answer sitting in the same slot 3 times running */
  let o,tries=0;const last=S.lastPos[g]||[];
  do{o=shuffle(T.opts.slice());tries++}while(tries<20&&last.length>=2&&last[last.length-1]===last[last.length-2]&&o.findIndex(x=>x.ok)===last[last.length-1]);
  const ci=o.findIndex(x=>x.ok);(S.lastPos[g]=last.concat(ci)).splice(0,Math.max(0,last.length-1));
  const instr=g===1?`Rotate the shape <b>${Math.abs(T.th)}°${Math.abs(T.th)===180?'':T.th>0?' clockwise':' anticlockwise'}</b>. Which option shows the result?`
-  :`Which option shows the <b>${T.vp}</b> view?${T.vp==='top'?' (looking down, front edge at the bottom)':''}`;
+  :`Which option shows the <b>${T.vp}</b> view?<div class="leg">In the picture, FRONT is the left-facing side and RIGHT is the right-facing side.${T.vp==='top'?' Top view: looking straight down, front edge at the bottom.':''}</div>`;
  const stim=g===1?shapeSVG(T.base,L):isoSVG(T.h,T.W,T.D);
  const opts=o.map((x,i)=>`<button class="opt" data-i="${i}">${g===1?shapeSVG(x.sh,L):matSVG(x)}</button>`).join('');
  $('#stage').innerHTML=`<div class="q">${instr}</div><div class="split"><div class="stim" id="stim">${stim}</div><div class="opts" id="opts" style="visibility:hidden">${opts}</div></div><div class="status" id="st"></div>`;
@@ -412,34 +466,38 @@ function runChoice(cur,g){
  phases(cur,hide,resp);
 }
 
-/* ---- Game 3: spatial transformation pad ---- */
+/* ---- Game 3: spatial transformation pad ----
+   ONE instruction per task. The player redraws the pattern as it would look AFTER that transformation
+   (no transform buttons: the transformation has to be done mentally). */
+const SYMS=[IDM,OPS.RR,OPS.RL,compose(['RR','RR']),OPS.MH,OPS.MV,compose(['RR','MH']),compose(['RL','MH'])]; /* the 8 rotations/reflections of a square */
+function scorePad(fin,T){
+ const finalJ=J(fin,T.exp);let recon=0;
+ SYMS.forEach(M=>{recon=Math.max(recon,J(fin,mapSegs(M,T.ref)))});
+ /* shape recalled (any orientation) = best match over the 8 symmetries; instruction applied = the instructed version is that best match */
+ return{finalJ,recon,xfOK:recon>=.5&&finalJ>=recon-1e-9};
+}
 function runPad(cur){
- const c=S.cfg,T=genPat(c.level),m=T.m,n=T.n;
- const P={base:new Map(),hist:[],net:IDM,sel:null,down:null,undo:0,xf:0};
+ const c=S.cfg,T=genPat(c.level),m=T.m,n=T.n,op=T.ops[0],hl=op==='MH'?'h':op==='MV'?'v':'';
+ const P={segs:new Map(),hist:[],sel:null,down:null,undo:0};
  cur.P=P;cur.T=T;
- const steps=T.ops.map(o=>`<li><b>${OPN[o]}</b><br><span class="leg">${OPD[o]}</span></li>`).join('');
- $('#stage').innerHTML=`<div class="g3"><div class="side">
-  <div class="card"><b>Apply in this order</b><ol>${steps}</ol></div>
-  <div class="card"><b>Reference</b><div class="refbox" id="ref">${latSVG(n,segsSVG(T.ref,m,'ln'))}</div></div>
+ $('#stage').innerHTML=`<div class="q">Memorise the pattern, then draw how it looks <b>after</b> the instruction.</div><div class="g3"><div class="side">
+  <div class="card"><div class="leg">Instruction</div><div class="instr">${OPN[op]}</div><div class="leg">${OPD[op]}</div></div>
+  <div class="card"><b>Reference</b><div class="refbox" id="ref">${latSVG(n,segsSVG(T.ref,m,'ln'),null,null,null,hl)}</div></div>
   <div class="card tl" id="tl">&nbsp;</div></div>
   <div><div class="padwrap"><div id="padBox" class="off"></div>
-  <div class="row"><button class="btn" data-op="RL">Rotate left<small>90° anticlockwise</small></button><button class="btn" data-op="RR">Rotate right<small>90° clockwise</small></button>
-  <button class="btn" data-op="MH">Mirror horizontal<small>top ⇄ bottom</small></button><button class="btn" data-op="MV">Mirror vertical<small>left ⇄ right</small></button></div>
   <div class="row"><button class="btn" id="bUndo">Undo</button><button class="btn" id="bClear">Clear</button><button class="btn pri" id="bSubmit">Submit</button></div>
   <div class="status" id="st"></div></div></div></div>`;
  const box=$('#padBox');
  const drawPad=()=>{
-  const fin=mapSegs(P.net,P.base),used=new Set();
-  fin.forEach(([p,q])=>{used.add(p+'');used.add(q+'')});
-  box.innerHTML=latSVG(n,segsSVG(fin,m,'ln'),used,P.sel,'pad');
+  const used=new Set();P.segs.forEach(([p,q])=>{used.add(p+'');used.add(q+'')});
+  box.innerHTML=latSVG(n,segsSVG(P.segs,m,'ln'),used,P.sel,'pad',hl);
  };
- const toast=t=>{$('#st').textContent=t;$('#st').className='status'};
  const padPt=e=>{const r=$('#pad').getBoundingClientRect(),sz=n*100,X=(e.clientX-r.left)/r.width*sz,Y=(e.clientY-r.top)/r.height*sz;let b=null,bd=1e9;
   for(let x=-m;x<=m;x++)for(let y=-m;y<=m;y++){const d=Math.hypot(X-PX(x,m),Y-PY(y,m));if(d<bd){bd=d;b=[x,y]}}return bd<=48?b:null};
  const connect=(a,b)=>{
-  const inv=invM(P.net),A=ap(inv,a),B=ap(inv,b),keys=[];
-  splitLine(A,B).forEach(s=>{const k=sk(s[0],s[1]);if(!P.base.has(k)){P.base.set(k,s);keys.push(k)}});
-  if(keys.length)P.hist.push({t:'l',keys});else toast('That line is already drawn');
+  const keys=[];
+  splitLine(a,b).forEach(s=>{const k=sk(s[0],s[1]);if(!P.segs.has(k)){P.segs.set(k,s);keys.push(k)}});
+  if(keys.length)P.hist.push(keys);else $('#st').textContent='That line is already drawn';
  };
  box.onpointerdown=e=>{if(cur.done||!cur.t0)return;P.down=padPt(e)};
  box.onpointercancel=()=>{P.down=null};
@@ -452,19 +510,13 @@ function runPad(cur){
   else{connect(P.sel,up);P.sel=up}
   drawPad();
  };
- document.querySelectorAll('[data-op]').forEach(b=>b.onclick=()=>{
-  if(cur.done||!cur.t0)return;
-  if(!P.base.size){toast('Draw the pattern first, then transform it');return}
-  P.hist.push({t:'x',prev:P.net});P.net=mul(OPS[b.dataset.op],P.net);P.xf++;P.sel=null;$('#st').textContent='';drawPad();
- });
  $('#bUndo').onclick=()=>{
   if(cur.done||!cur.t0||!P.hist.length)return;
-  const h=P.hist.pop();if(h.t==='l')h.keys.forEach(k=>P.base.delete(k));else P.net=h.prev;
-  P.undo++;P.sel=null;drawPad();
+  P.hist.pop().forEach(k=>P.segs.delete(k));P.undo++;P.sel=null;drawPad();
  };
  $('#bClear').onclick=()=>{
-  if(cur.done||!cur.t0||(!P.base.size&&P.net===IDM))return;
-  P.base.clear();P.hist=[];P.net=IDM;P.sel=null;P.undo++;drawPad();
+  if(cur.done||!cur.t0||!P.segs.size)return;
+  P.segs.clear();P.hist=[];P.undo++;P.sel=null;drawPad();
  };
  $('#bSubmit').onclick=()=>g3Submit(cur,false);
  const hide=()=>{$('#ref').innerHTML='Reference hidden';$('#tl').textContent='Hold the pattern in mind'};
@@ -480,23 +532,23 @@ function runPad(cur){
 function g3Submit(cur,auto){
  if(!S||S.done||cur.done||!cur.t0||S.cur!==cur)return;
  cur.done=true;clearInterval(cur.iv);
- const rt=performance.now()-cur.t0,P=cur.P,T=cur.T,m=T.m,fin=mapSegs(P.net,P.base);
- const recon=J(P.base,T.ref),finalJ=J(fin,T.exp),xfOK=keysEq(mapSegs(P.net,T.ref),T.exp);
+ const rt=performance.now()-cur.t0,P=cur.P,T=cur.T,m=T.m,fin=P.segs,op=T.ops[0],hl=op==='MH'?'h':op==='MV'?'v':'';
+ const sc=scorePad(fin,T);
  let hit=0;T.exp.forEach((_,k)=>{if(fin.has(k))hit++});
- const complete=hit===T.exp.size;
- record(cur,{correct:finalJ===1,rt,recon,final:finalJ,xfOK,undo:P.undo,auto,complete});
+ record(cur,{correct:sc.finalJ===1,rt,recon:sc.recon,final:sc.finalJ,xfOK:sc.xfOK,undo:P.undo,auto,complete:hit===T.exp.size});
  /* reveal: green = correct answer, blue over green = matched, red = extra */
  let mat='',extra='';
  fin.forEach((s,k)=>{const hitK=T.exp.has(k),svg=segsSVG(new Map([[k,s]]),m,hitK?'rm':'rb');if(hitK)mat+=svg;else extra+=svg});
  const used=new Set();T.exp.forEach(([p,q])=>{used.add(p+'');used.add(q+'')});
  $('#padBox').classList.remove('off');
- $('#padBox').innerHTML=latSVG(T.n,segsSVG(T.exp,m,'rx')+mat+extra,used,null,'pad');
+ $('#padBox').innerHTML=latSVG(T.n,segsSVG(T.exp,m,'rx')+mat+extra,used,null,'pad',hl);
  $('#padBox').onpointerdown=$('#padBox').onpointerup=null;
+ $('#ref').innerHTML=latSVG(T.n,segsSVG(T.ref,m,'ln'),null,null,null,hl);
  $('#tl').textContent=auto?'Time expired: submitted automatically':'Submitted';
- document.querySelectorAll('.padwrap .btn').forEach(b=>b.disabled=true);
+ $('#bUndo').disabled=$('#bClear').disabled=true;
  const fb=S.cfg.fb;
- $('#st').className='status'+(fb?(finalJ===1?' ok':' bad'):'');
- $('#st').innerHTML=(fb?`<b>${finalJ===1?'Correct':'Not quite'}</b> – pattern match ${Math.round(finalJ*100)}%<br>`:'')+'<span class="leg">Green = correct answer. Blue over green = your matching lines. Green only = missed. Red = extra.</span>';
+ $('#st').className='status'+(fb?(sc.finalJ===1?' ok':' bad'):'');
+ $('#st').innerHTML=(fb?`<b>${sc.finalJ===1?'Correct':'Not quite'}</b> – pattern match ${Math.round(sc.finalJ*100)}%<br>`:'')+'<span class="leg">Green = correct answer. Blue over green = your matching lines. Green only = missed. Red = extra.</span>';
  $('#bSubmit').outerHTML='<button class="btn pri" id="bNext">Next task</button>';
  $('#bNext').onclick=()=>{if(S&&!S.done&&S.cur===cur)nextTrial()};
 }
@@ -521,11 +573,11 @@ function endSession(){
   [1,2,3].forEach(g=>{const a=tr.filter(t=>t.g===g);if(!a.length)return;
    h+=`<h2>${NAMES[g]}</h2><div class="card"><table>${block(a)}`;
    if(g===3){const av=k=>Math.round(100*a.reduce((s,t)=>s+t[k],0)/a.length)+'%',u=a.reduce((s,t)=>s+t.undo,0),au=a.filter(t=>t.auto).length;
-    h+=row('Reconstruction accuracy',av('recon'))+row('Transformation accuracy',pct(a.filter(t=>t.xfOK).length,a.length))+row('Final pattern accuracy',av('final'))
+    h+=row('Reconstruction accuracy (shape recalled, any orientation)',av('recon'))+row('Transformation accuracy (instruction applied correctly)',pct(a.filter(t=>t.xfOK).length,a.length))+row('Final pattern accuracy',av('final'))
      +row('Corrections made (undo and clear)',u+' (mean '+(u/a.length).toFixed(1)+' per task)')
      +row('Submission',(a.length-au)+' manual, '+au+' automatic at timeout')+row('Completion',a.filter(t=>t.complete).length+' of '+a.length+' tasks with every required line drawn')}
    h+='</table></div>'});
-  if(tr.some(t=>t.g===3))h+='<p class="hint">Game 3 accuracy = tasks whose final pattern matched the correct answer exactly. Reconstruction accuracy compares the drawing, before the transformations, with the reference; final pattern accuracy compares the submitted drawing with the transformed answer (both use shared lines ÷ all lines, so missing or extra lines lower the score). Transformation accuracy = the applied transformations produced the correct final orientation.</p>';
+  if(tr.some(t=>t.g===3))h+='<p class="hint">Game 3 accuracy = tasks whose submitted pattern matched the transformed answer exactly. Final pattern accuracy = shared lines ÷ all lines (missing or extra lines lower it). Reconstruction accuracy = the best match between the drawing and the reference under any of the 8 rotations/reflections, so it measures shape recall independent of the transformation. Transformation accuracy counts a task when the drawing is at least 50% similar to some version of the reference and the closest version is the instructed one.</p>';
  }
  h+='<button class="big" id="again" style="margin-top:20px">New session</button>';
  $('#results').innerHTML=h;show('results');window.scrollTo(0,0);
